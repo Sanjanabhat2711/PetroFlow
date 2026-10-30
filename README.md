@@ -1,10 +1,10 @@
-# 🛢️ PetroFlow — Petroleum Supply Chain Dashboard
+# PetroFlow — Petroleum Supply Chain Dashboard
 
 A role-based, interactive supply chain tracking system for the petroleum industry. Built with React, TypeScript, Vite, and SQLite.
 
 ---
 
-## 📌 What This Project Does
+##  What This Project Does
 
 - Tracks the full petroleum supply chain: **Crude Purchase → Refining → Storage → Distribution → Retail**
 - Role-based access: each user only sees the pipeline stages relevant to their role
@@ -14,7 +14,7 @@ A role-based, interactive supply chain tracking system for the petroleum industr
 
 ---
 
-## ⚙️ How to Run Locally
+## How to Run Locally
 
 **Prerequisites:** Node.js (v18+)
 
@@ -34,7 +34,7 @@ Then open `http://localhost:5173` in your browser.
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 petroleum_supply_chain/
@@ -55,7 +55,7 @@ petroleum_supply_chain/
 
 ---
 
-## 🔄 Changes Made (Summary)
+## Changes Made (Summary)
 
 | # | Change | Description |
 |---|--------|-------------|
@@ -69,7 +69,7 @@ petroleum_supply_chain/
 
 ---
 
-## 📊 LCA Formulations
+## LCA Formulations
 
 The Environmental AI Engine uses the following standardized formulas based on IPCC / IMO directives to calculate CO₂ equivalent footprint per stage:
 
@@ -94,17 +94,12 @@ The Environmental AI Engine uses the following standardized formulas based on IP
 
 ---
 
-## 🔐 Environment Variables
+## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `GEMINI_API_KEY` | Your Google Gemini API key (get it from [Google AI Studio](https://aistudio.google.com)) |
 | `DATABASE_URL` | Path to SQLite DB (defaults to `./petroleum_supply_chain.db`) |
 
-> **Note:** Never commit your `.env` file. It is excluded via `.gitignore`.
 
----
 
-## 👥 Team
-
-Built for DBMS coursework. Feel free to clone and extend!
