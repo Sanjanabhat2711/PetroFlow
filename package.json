@@ -1,7 +1,7 @@
 {
-  "name": "react-example",
+  "name": "petroflow",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -9,23 +9,27 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "start": "tsx server.ts"
+    "start": "node dist/server.js",
+    "vercel-build": "vite build && npx esbuild server.ts db.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.js --external:better-sqlite3 --external:sqlite3 --external:mysql2 --external:vite"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
+    "@types/d3": "^7.4.3",
     "@vitejs/plugin-react": "^5.0.4",
     "axios": "^1.14.0",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.8.0",
     "clsx": "^2.1.1",
     "cors": "^2.8.6",
+    "d3": "^7.9.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "mysql2": "^3.20.0",
+    "nodemailer": "^8.0.11",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.13.2",
@@ -36,10 +40,18 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/nodemailer": "^6.4.24",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.8.0": true,
+    "esbuild@0.27.5": true,
+    "esbuild@0.25.12": true,
+    "protobufjs@7.5.4": true,
+    "sqlite3@6.0.1": true
   }
 }

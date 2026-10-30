@@ -5,12 +5,22 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import path from 'path';
+import nodemailer from 'nodemailer';
 import { createServer as createViteServer } from 'vite';
 import { query, initializeDatabase } from './db.js';
 
 const app = express();
 const PORT = 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_jwt_key_change_this_in_production';
+
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.ethereal.email',
+  port: Number(process.env.SMTP_PORT) || 587,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
 
 app.use(cors());
 app.use(express.json());
@@ -54,10 +64,14 @@ const authenticateToken = (req: any, res: any, next: any) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) return res.sendStatus(401);
+  if (!token || token === 'null' || token === 'undefined') {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
 
   jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-    if (err) return res.sendStatus(403);
+    if (err) {
+      return res.status(401).json({ error: 'Session expired. Please login again.' });
+    }
     req.user = user;
     next();
   });
@@ -66,15 +80,76 @@ const authenticateToken = (req: any, res: any, next: any) => {
 // --- Auth Routes ---
 
 app.post('/api/register', async (req, res) => {
-  const { username, password, role } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  const { username, email, password, role } = req.body;
+  if (!username || !password || !email) return res.status(400).json({ error: 'Username, email and password required' });
 
   const hashedPassword = await bcrypt.hash(password, 10);
   try {
-    await query('INSERT INTO Users (username, password_hash, role) VALUES (?, ?, ?)', [username, hashedPassword, role || 'USER']);
+    await query(
+      'INSERT INTO Users (username, email, password_hash, role) VALUES (?, ?, ?, ?)', 
+      [username, email, hashedPassword, role || 'USER']
+    );
     res.status(201).json({ message: 'User registered successfully' });
-  } catch (err) {
+  } catch (err: any) {
+    if (err.message.includes('UNIQUE constraint failed: Users.email') || err.message.includes('Duplicate entry')) {
+      return res.status(400).json({ error: 'Email already exists' });
+    }
     res.status(400).json({ error: 'Username already exists' });
+  }
+});
+
+app.post('/api/forgot-password/send-otp', async (req, res) => {
+  const { email } = req.body;
+  try {
+    const results: any = await query('SELECT username FROM Users WHERE email = ?', [email]);
+    if (results.length === 0) return res.status(404).json({ error: 'User with this email not found' });
+    
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    
+    await query('UPDATE Users SET otp = ?, otp_expiry = ? WHERE email = ?', [otp, expiry.toISOString(), email]);
+    
+    // Send email
+    if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+      await transporter.sendMail({
+        from: '"Petroleum Integrity System" <noreply@petrointegrity.com>',
+        to: email,
+        subject: "Your OTP for Password Reset",
+        text: `Your One-Time Password (OTP) for password reset is: ${otp}. It expires in 10 minutes.`,
+        html: `<p>Your One-Time Password (OTP) for password reset is: <b>${otp}</b>.</p><p>It expires in 10 minutes.</p>`
+      });
+      res.json({ message: 'OTP sent to email' });
+    } else {
+      console.log(`[DEV MODE] OTP for ${email}: ${otp}`);
+      res.json({ message: 'OTP generated and logged (Check server logs in dev)', dev_otp: otp });
+    }
+  } catch (err: any) {
+    console.error('OTP Error:', err);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+app.post('/api/forgot-password/verify-otp', async (req, res) => {
+  const { email, otp, new_password } = req.body;
+  try {
+    const results: any = await query('SELECT * FROM Users WHERE email = ?', [email]);
+    if (results.length === 0) return res.status(404).json({ error: 'User not found' });
+    
+    const user = results[0];
+    if (user.otp !== otp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+    
+    if (new Date(user.otp_expiry) < new Date()) {
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+
+    const hashedPassword = await bcrypt.hash(new_password, 10);
+    await query('UPDATE Users SET password_hash = ?, otp = NULL, otp_expiry = NULL WHERE email = ?', [hashedPassword, email]);
+    res.json({ message: 'Password reset successfully' });
+  } catch (err: any) {
+    console.error('Verify error:', err);
+    res.status(500).json({ error: 'Failed to reset password' });
   }
 });
 
@@ -107,7 +182,7 @@ const createCRUDRoutes = (tableName: string, idField: string) => {
     'Refining_Process': 'REFINING_MANAGER',
     'Distribution': 'DISTRIBUTION_MANAGER',
     'Retail': 'RETAIL_MANAGER',
-    'CO2_Emissions': 'ENVIRONMENT_MANAGER'
+    'CO2_Emissions': 'SYSTEM_ONLY' // Manual entries disabled, logic handles calculations
   };
 
   const checkRole = (req: any, res: any, next: any) => {
@@ -120,13 +195,32 @@ const createCRUDRoutes = (tableName: string, idField: string) => {
     }
   };
 
-  // ============================================================================
-  // PRESENTATION HIGHLIGHT: SUPPLY CHAIN DATABASE ROUTING & CONNECTION
-  // This generic CRUD generator handles queries from the frontend to the DB
-  // for all supply chain stages securely based on the user's managerial role.
-  // Example query generated below: SELECT * FROM Crude_Purchase
-  // ============================================================================
-  
+  const processAlerts = async (data: any) => {
+    if (tableName === 'Storage_Batch') {
+      const capacity = Number(data.Current_Capacity);
+      const threshold = Number(data.Threshold) || 5000;
+      if (capacity < threshold) {
+        await query(`
+          INSERT INTO System_Alerts (Type, Message)
+          VALUES (?, ?)
+        `, ['CRITICAL_STOCK', `Tank ${data.Tank_Number} (Batch ${data.Batch_ID}) is below threshold: ${capacity}L / ${threshold}L`]);
+        
+        // Auto Reorder Trigger
+        await query(`
+          INSERT INTO System_Alerts (Type, Message)
+          VALUES (?, ?)
+        `, ['AUTO_REORDER', `Auto-reorder initiated for Tank ${data.Tank_Number}. Current stock: ${capacity}L`]);
+      }
+    }
+  };
+
+  const logCorrectionSnapshot = async (id: string, error: string, snapshot: any, user: any = null) => {
+    await query(`
+      INSERT INTO Correction_Snapshots (Table_Name, Record_ID, Error_Description, JSON_Snapshot, Triggered_By_Username, Triggered_By_Role)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [tableName, id, error, JSON.stringify(snapshot), user?.username || 'SYSTEM', user?.role || 'SYSTEM']);
+  };
+
   // GET all
   app.get(`/api/${tableName.toLowerCase()}`, authenticateToken, async (req, res) => {
     try {
@@ -141,6 +235,14 @@ const createCRUDRoutes = (tableName: string, idField: string) => {
   app.post(`/api/${tableName.toLowerCase()}`, authenticateToken, checkRole, async (req, res) => {
     const { signature, ...data } = req.body;
     
+    // Negative value validation
+    const numericFields = ['Volume', 'Price', 'Quantity', 'Distance', 'Current_Capacity', 'Threshold', 'Input_Volume', 'Output_Volume', 'Dispatch_Volume', 'Receive_Volume'];
+    for (const field of numericFields) {
+      if (data[field] !== undefined && Number(data[field]) < 0) {
+        return res.status(400).json({ error: `${field.replace('_', ' ')} cannot be negative.` });
+      }
+    }
+
     // Throughput Efficiency Calculation
     if (tableName === 'Refining_Process' && data.Input_Volume && data.Output_Volume) {
       data.Throughput_Efficiency = (data.Output_Volume / data.Input_Volume) * 100;
@@ -156,25 +258,35 @@ const createCRUDRoutes = (tableName: string, idField: string) => {
         values
       );
       
-      await addToLedger(tableName, data[idField], data, signature || 'SYSTEM_GEN');
+      await processAlerts(data);
+      await addToLedger(tableName, data[idField], data, (req as any).user?.username || signature || 'ANONYMOUS');
       res.status(201).json({ message: 'Record created and ledger updated', id: data[idField] });
     } catch (err: any) {
       console.error(`Error adding to ${tableName}:`, err);
+      await logCorrectionSnapshot(data[idField] || 'NEW', err.message, data, (req as any).user);
       let errorMessage = err.message;
       if (err.message.includes('foreign key constraint fails')) {
         errorMessage = 'Reference ID not found in the related table. Please verify your IDs.';
-      } else if (err.message.includes('Duplicate entry')) {
-        errorMessage = 'A record with this ID already exists.';
+      } else if (err.message.includes('Duplicate entry') || err.message.includes('UNIQUE constraint failed')) {
+        errorMessage = 'A record with this ID already exists. Please use a unique identification number.';
       }
       res.status(400).json({ error: errorMessage });
     }
   });
 
   // PUT update (Correction with Snapshot)
-  app.put(`/api/${tableName.toLowerCase()}/:id`, authenticateToken, async (req, res) => {
+  app.put(`/api/${tableName.toLowerCase()}/:id`, authenticateToken, checkRole, async (req, res) => {
     const { id } = req.params;
     const { signature, ...data } = req.body;
     
+    // Negative value validation
+    const numericFields = ['Volume', 'Price', 'Quantity', 'Distance', 'Current_Capacity', 'Threshold', 'Input_Volume', 'Output_Volume', 'Dispatch_Volume', 'Receive_Volume'];
+    for (const field of numericFields) {
+      if (data[field] !== undefined && Number(data[field]) < 0) {
+        return res.status(400).json({ error: `${field.replace('_', ' ')} cannot be negative.` });
+      }
+    }
+
     try {
       const results: any = await query(`SELECT * FROM ${tableName} WHERE ${idField} = ?`, [id]);
       const oldData = results[0];
@@ -186,10 +298,12 @@ const createCRUDRoutes = (tableName: string, idField: string) => {
 
       await query(`UPDATE ${tableName} SET ${setClause} WHERE ${idField} = ?`, values);
       
-      await addToLedger(tableName, id, data, signature || 'SYSTEM_CORRECTION', 'UPDATE', oldData);
+      await processAlerts(data);
+      await addToLedger(tableName, id, data, (req as any).user?.username || signature || 'SYSTEM_CORRECTION', 'UPDATE', oldData);
       res.json({ message: 'Record updated and correction logged' });
     } catch (err: any) {
       console.error(`Error updating ${tableName}:`, err);
+      await logCorrectionSnapshot(id, err.message, data, (req as any).user);
       let errorMessage = err.message;
       if (err.message.includes('foreign key constraint fails')) {
         errorMessage = 'Reference ID not found in the related table. Please verify your IDs.';
@@ -208,6 +322,36 @@ createCRUDRoutes('Distribution', 'Distribution_ID');
 createCRUDRoutes('Retail', 'Retail_ID');
 createCRUDRoutes('CO2_Emissions', 'Emission_ID');
 
+// Trust Score Route
+app.get('/api/trust-scores', authenticateToken, async (req, res) => {
+  try {
+    const successfulLedger: any = await query('SELECT Digital_Signature_Sender, COUNT(*) as count FROM Transaction_Ledger GROUP BY Digital_Signature_Sender');
+    const failedSnapshots: any = await query('SELECT Triggered_By_Username, COUNT(*) as count FROM Correction_Snapshots GROUP BY Triggered_By_Username');
+    const users: any = await query('SELECT username, role FROM Users');
+
+    const scores = users.map((u: any) => {
+      const success = successfulLedger.find((l: any) => l.Digital_Signature_Sender === u.username)?.count || 0;
+      const failed = failedSnapshots.find((s: any) => s.Triggered_By_Username === u.username)?.count || 0;
+      const total = success + failed;
+      const score = total === 0 ? 100 : Math.round((success / total) * 100);
+      
+      return {
+        username: u.username,
+        role: u.role,
+        success,
+        failed,
+        total,
+        score
+      };
+    }).sort((a: any, b: any) => b.score - a.score);
+
+    res.json(scores);
+  } catch (err: any) {
+    console.error('Trust Score error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Ledger Route
 app.get('/api/ledger', authenticateToken, async (req, res) => {
   try {
@@ -222,51 +366,274 @@ app.get('/api/ledger', authenticateToken, async (req, res) => {
 // Provenance Tracking
 app.get('/api/provenance/:type/:id', authenticateToken, async (req, res) => {
   const { type, id } = req.params;
-  let provenance: any = {};
+  let provenance: any = {
+    crude: null,
+    transport: null,
+    storage: null,
+    refining: null,
+    distribution: null,
+    retail: null
+  };
 
   try {
-    if (type === 'retail') {
-      const retailResults: any = await query('SELECT * FROM Retail WHERE Retail_ID = ?', [id]);
-      const retail = retailResults[0];
-      if (retail) {
-        provenance.retail = retail;
-        const distResults: any = await query('SELECT * FROM Distribution WHERE Distribution_ID = ?', [retail.Distribution_ID]);
-        const dist = distResults[0];
-        if (dist) {
-          provenance.distribution = dist;
-          const refineResults: any = await query('SELECT * FROM Refining_Process WHERE Refine_ID = ?', [dist.Refine_ID]);
-          const refine = refineResults[0];
-          if (refine) {
-            provenance.refining = refine;
-            const batchResults: any = await query('SELECT * FROM Storage_Batch WHERE Batch_ID = ?', [refine.Batch_ID]);
-            const batch = batchResults[0];
-            if (batch) {
-              provenance.storage = batch;
-              const transitResults: any = await query('SELECT * FROM Transportation_Log WHERE Transit_ID = ?', [batch.Transit_ID]);
-              const transit = transitResults[0];
-              if (transit) {
-                provenance.transport = transit;
-                const crudeResults: any = await query('SELECT * FROM Crude_Purchase WHERE Purchase_ID = ?', [transit.Purchase_ID]);
-                provenance.crude = crudeResults[0];
-              }
-            }
-          }
-        }
-      }
+    const row = await getTrace(type, id);
+    if (!row[type]) {
+      return res.status(404).json({ error: `Record ${id} not found` });
     }
-    res.json(provenance);
+    res.json(row);
   } catch (err: any) {
     console.error('Provenance error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// Shared Tracing Logic
+async function getTrace(type: string, id: string) {
+  const provenance: any = { crude: null, transport: null, storage: null, refining: null, distribution: null, retail: null };
+  const tables = ['Crude_Purchase', 'Transportation_Log', 'Storage_Batch', 'Refining_Process', 'Distribution', 'Retail'];
+  const idFields = ['Purchase_ID', 'Transit_ID', 'Batch_ID', 'Refine_ID', 'Distribution_ID', 'Retail_ID'];
+  const stageKeys = ['crude', 'transport', 'storage', 'refining', 'distribution', 'retail'];
+  
+  const stageIdx = stageKeys.indexOf(type);
+  if (stageIdx === -1) throw new Error('Invalid stage type');
+
+  const currentRes: any = await query(`SELECT * FROM ${tables[stageIdx]} WHERE ${idFields[stageIdx]} = ?`, [id]);
+  if (!currentRes[0]) return provenance;
+  
+  provenance[type] = currentRes[0];
+  
+  // Trace Backward
+  let cursor = currentRes[0];
+  for (let i = stageIdx - 1; i >= 0; i--) {
+    const fkField = i === 0 ? 'Purchase_ID' : i === 1 ? 'Transit_ID' : i === 2 ? 'Batch_ID' : i === 3 ? 'Refine_ID' : 'Distribution_ID';
+    const parentId = cursor[fkField];
+    if (!parentId) break;
+    const parentRes: any = await query(`SELECT * FROM ${tables[i]} WHERE ${idFields[i]} = ?`, [parentId]);
+    if (parentRes[0]) {
+      provenance[stageKeys[i]] = parentRes[0];
+      cursor = parentRes[0];
+    } else break;
+  }
+  
+  // Trace Forward
+  cursor = currentRes[0];
+  for (let i = stageIdx + 1; i < tables.length; i++) {
+    const childIdFieldToMatch = i === 1 ? 'Purchase_ID' : i === 2 ? 'Transit_ID' : i === 3 ? 'Batch_ID' : i === 4 ? 'Refine_ID' : 'Distribution_ID';
+    const childRes: any = await query(`SELECT * FROM ${tables[i]} WHERE ${childIdFieldToMatch} = ?`, [cursor[idFields[i-1]]]);
+    if (childRes[0]) {
+      provenance[stageKeys[i]] = childRes[0];
+      cursor = childRes[0];
+    } else break;
+  }
+  return provenance;
+}
+
 // Reorder Alerts
-app.get('/api/alerts', authenticateToken, (req, res) => {
+app.get('/api/alerts', authenticateToken, async (req, res) => {
   try {
-    res.json({ stockAlerts: [], storageAlerts: [] });
+    const alerts = await query("SELECT * FROM System_Alerts WHERE Status = 'ACTIVE' ORDER BY Created_At DESC LIMIT 20");
+    const storageAlerts = (alerts as any[]).filter(a => a.Type === 'CRITICAL_STOCK');
+    const reorderAlerts = (alerts as any[]).filter(a => a.Type === 'AUTO_REORDER');
+    res.json({ stockAlerts: reorderAlerts, storageAlerts: storageAlerts, all: alerts });
   } catch (err: any) {
     console.error('Alerts error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/alerts/history', authenticateToken, async (req, res) => {
+  try {
+    const alerts = await query("SELECT * FROM System_Alerts WHERE Status != 'ACTIVE' ORDER BY Created_At DESC LIMIT 50");
+    res.json(alerts);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/alerts/:id/acknowledge', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await query("UPDATE System_Alerts SET Status = 'ACKNOWLEDGED' WHERE Alert_ID = ?", [id]);
+    res.json({ message: 'Alert acknowledged' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Environmental Compliance Report & LCA Tracking
+app.get('/api/compliance/:batchId', authenticateToken, async (req, res) => {
+  const { batchId } = req.params;
+
+  try {
+    // Detect type from prefix
+    let type = 'storage';
+    const upperId = batchId.toUpperCase();
+    if (upperId.startsWith('RT')) type = 'retail';
+    else if (upperId.startsWith('D')) type = 'distribution';
+    else if (upperId.startsWith('R')) type = 'refining';
+    else if (upperId.startsWith('S')) type = 'storage';
+    else if (upperId.startsWith('T')) type = 'transport';
+    else if (upperId.startsWith('C')) type = 'crude';
+
+    let provenance = await getTrace(type, upperId);
+    
+    // Exhaustive fallback: If not found by prefix, try every table
+    if (!Object.values(provenance).some(v => v !== null)) {
+      const stageKeys = ['crude', 'transport', 'storage', 'refining', 'distribution', 'retail'];
+      for (const k of stageKeys) {
+        if (k === type) continue; // Skip since we already tried it
+        const fallback = await getTrace(k, upperId);
+        if (Object.values(fallback).some(v => v !== null)) {
+          provenance = fallback;
+          break;
+        }
+      }
+    }
+
+    if (!Object.values(provenance).some(v => v !== null)) {
+      return res.status(404).json({ error: 'Batch journey data not found. System could not locate any records for this ID in any supply chain stage.' });
+    }
+
+    // Collect all unique IDs in the journey
+    const journeyIds: string[] = [];
+    const idFields = ['Purchase_ID', 'Transit_ID', 'Batch_ID', 'Refine_ID', 'Distribution_ID', 'Retail_ID'];
+    const stageKeys = ['crude', 'transport', 'storage', 'refining', 'distribution', 'retail'];
+    
+    stageKeys.forEach((key, idx) => {
+      if (provenance[key]) {
+        journeyIds.push(provenance[key][idFields[idx]]);
+      }
+    });
+
+    if (journeyIds.length === 0) return res.json({ error: 'No journey data' });
+
+    // --- LCA CALCULATIONS USING USER FORMULAS ---
+    const v_crude = provenance.crude?.Volume || 0;
+    const v_transport = provenance.transport?.Quantity || v_crude;
+    const d_transport = provenance.transport?.Distance || 500;
+    const v_storage = provenance.storage?.Current_Capacity || v_transport;
+    const v_refining = provenance.refining?.Input_Volume || v_storage;
+    const v_distribution = provenance.distribution?.Dispatch_Volume || v_refining;
+    const d_distribution = provenance.distribution?.Distance || 200;
+    const v_retail = provenance.retail?.Receive_Volume || v_distribution;
+
+    const e1_crude = (v_crude * 0.15) * 0.4;
+    const e2_transport = d_transport * (v_transport * 0.00085) * 0.062;
+    const e3_storage = (v_storage * 0.02 * 0.4) + (v_storage * 0.0005 * 2.3);
+    const e4_refining = (v_refining * 0.45) * 0.4;
+    const e5_distribution = d_distribution * (v_distribution * 0.00085) * 0.062;
+    const e6_retail = v_retail * 2.31;
+
+    const stageEmissions = [
+      { stage: 'Crude Purchase', value: e1_crude, color: 'blue' },
+      { stage: 'Transportation', value: e2_transport, color: 'amber' },
+      { stage: 'Storage', value: e3_storage, color: 'teal' },
+      { stage: 'Refining', value: e4_refining, color: 'purple' },
+      { stage: 'Distribution', value: e5_distribution, color: 'emerald' },
+      { stage: 'Retail Point', value: e6_retail, color: 'pink' }
+    ];
+
+    const totalEmissions = e1_crude + e2_transport + e3_storage + e4_refining + e5_distribution + e6_retail;
+    const carbonIntensity = v_crude > 0 ? totalEmissions / v_crude : 0;
+
+    const hotspot = stageEmissions.reduce((prev, current) => (prev.value > current.value) ? prev : current);
+
+    const breakdown = stageEmissions.map(s => ({
+      ...s,
+      percentage: totalEmissions > 0 ? (s.value / totalEmissions) * 100 : 0
+    }));
+
+    res.json({
+      batchId,
+      stages: { 
+        crude: provenance.crude, 
+        transport: provenance.transport, 
+        storage: provenance.storage, 
+        refining: provenance.refining, 
+        distribution: provenance.distribution, 
+        retail: provenance.retail 
+      },
+      totalEmissions,
+      carbonIntensity,
+      hotspot,
+      breakdown,
+      complianceStatus: carbonIntensity < 2.5 ? 'COMPLIANT' : 'WARNING: HIGH CARBON INTENSITY',
+      lcaReport: {
+        footprint: totalEmissions,
+        unit: 'kg CO2',
+        assessmentDate: new Date().toISOString(),
+        boundary: 'Cradle-to-Grave',
+        methodology: 'Simplified Process-based LCA (IPCC guidelines)'
+      }
+    });
+  } catch (err: any) {
+    console.error('Compliance error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Transporter Trust Scores
+app.get('/api/transporters/scores', authenticateToken, async (req, res) => {
+  try {
+    const logs: any = await query('SELECT * FROM Transportation_Log');
+    const scores: Record<string, { total: number, verified: number, qualityTotal: number, count: number }> = {};
+    
+    logs.forEach((log: any) => {
+      const id = log.Vehicle_ID;
+      if (!scores[id]) scores[id] = { total: 0, verified: 0, qualityTotal: 0, count: 0 };
+      
+      scores[id].count++;
+      // Integrity: Quantity consistency check (simulated based on Arrival presence)
+      if (log.Arrival_Time) scores[id].verified++;
+      
+      // Quality: Based on Fuel_Quality character mapping
+      const qualityScore = log.Fuel_Quality?.toLowerCase().includes('good') || log.Fuel_Quality?.toLowerCase().includes('verified') ? 100 : 70;
+      scores[id].qualityTotal += qualityScore;
+    });
+
+    const finalScores = Object.entries(scores).map(([id, stats]) => ({
+      id,
+      integrity: Math.round((stats.verified / stats.count) * 100),
+      quality: Math.round(stats.qualityTotal / stats.count),
+      rating: Math.round(((stats.verified / stats.count) * 50) + ((stats.qualityTotal / stats.count / 100) * 50))
+    })).sort((a, b) => b.rating - a.rating);
+
+    res.json(finalScores);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// JSON Correction Snapshots
+app.get('/api/snapshots', authenticateToken, async (req, res) => {
+  try {
+    const rows = await query('SELECT * FROM Correction_Snapshots ORDER BY Timestamp DESC');
+    res.json(Array.isArray(rows) ? rows : []);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Single Record Fetch for Snapshots Comparison
+app.get('/api/record/:tableName/:id', authenticateToken, async (req, res) => {
+  const { tableName, id } = req.params;
+  const idFields: Record<string, string> = {
+    'Crude_Purchase': 'Purchase_ID',
+    'Transportation_Log': 'Transit_ID',
+    'Storage_Batch': 'Batch_ID',
+    'Refining_Process': 'Refine_ID',
+    'Distribution': 'Distribution_ID',
+    'Retail': 'Retail_ID',
+    'CO2_Emissions': 'Emission_ID'
+  };
+
+  const idField = idFields[tableName];
+  if (!idField) return res.status(400).json({ error: 'Invalid table name' });
+
+  try {
+    const results: any = await query(`SELECT * FROM ${tableName} WHERE ${idField} = ?`, [id]);
+    res.json(results[0] || null);
+  } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -283,145 +650,51 @@ app.get('/api/ledger/reconstruct/:tableName/:recordId', authenticateToken, async
   }
 });
 
-// Pipeline Status Tracker
-app.get('/api/pipeline_status', authenticateToken, async (req, res) => {
+// Available IDs for Workflow Stages
+app.get('/api/workflow/available-ids/:stage', authenticateToken, async (req, res) => {
+  const { stage } = req.params;
+  
+  const stageConfig: Record<string, { table: string, idField: string, prefix: string, prevTable: string, prevIdField: string, prevPrefix: string }> = {
+    'transport': { 
+      table: 'Transportation_Log', idField: 'Transit_ID', prefix: 'T',
+      prevTable: 'Crude_Purchase', prevIdField: 'Purchase_ID', prevPrefix: 'C' 
+    },
+    'storage': { 
+      table: 'Storage_Batch', idField: 'Batch_ID', prefix: 'S',
+      prevTable: 'Transportation_Log', prevIdField: 'Transit_ID', prevPrefix: 'T' 
+    },
+    'refining': { 
+      table: 'Refining_Process', idField: 'Refine_ID', prefix: 'R',
+      prevTable: 'Storage_Batch', prevIdField: 'Batch_ID', prevPrefix: 'S' 
+    },
+    'distribution': { 
+      table: 'Distribution', idField: 'Distribution_ID', prefix: 'D',
+      prevTable: 'Refining_Process', prevIdField: 'Refine_ID', prevPrefix: 'R' 
+    },
+    'retail': { 
+      table: 'Retail', idField: 'Retail_ID', prefix: 'RT',
+      prevTable: 'Distribution', prevIdField: 'Distribution_ID', prevPrefix: 'D' 
+    }
+  };
+
+  const config = stageConfig[stage.toLowerCase()];
+  if (!config) return res.status(400).json({ error: 'Invalid stage' });
+
   try {
-    const c = await query('SELECT Purchase_ID FROM Crude_Purchase');
-    const t = await query('SELECT Transit_ID, Purchase_ID FROM Transportation_Log');
-    const s = await query('SELECT Batch_ID, Transit_ID FROM Storage_Batch');
-    const rp = await query('SELECT Refine_ID, Batch_ID FROM Refining_Process');
-    const d = await query('SELECT Distribution_ID, Refine_ID FROM Distribution');
-    const r = await query('SELECT Retail_ID, Distribution_ID FROM Retail');
-    
-    let chains = [];
-    
-    // Chains tracing from Crude
-    for (let crude of c) {
-        let stage = 0;
-        let trans = t.find((x:any) => x.Purchase_ID === crude.Purchase_ID);
-        let stor = trans ? s.find((x:any) => x.Transit_ID === trans.Transit_ID) : null;
-        let ref = stor ? rp.find((x:any) => x.Batch_ID === stor.Batch_ID) : null;
-        let dist = ref ? d.find((x:any) => x.Refine_ID === ref.Refine_ID) : null;
-        let ret = dist ? r.find((x:any) => x.Distribution_ID === dist.Distribution_ID) : null;
-        
-        if (trans) stage = 1;
-        if (stor) stage = 2;
-        if (ref) stage = 3;
-        if (dist) stage = 4;
-        if (ret) stage = 5;
-        chains.push({ id: crude.Purchase_ID, stage });
-    }
-    
-    // Independent Transport orphans
-    for (let trans of t.filter((x:any) => !x.Purchase_ID)) {
-        let stage = 1;
-        let stor = s.find((x:any) => x.Transit_ID === trans.Transit_ID);
-        let ref = stor ? rp.find((x:any) => x.Batch_ID === stor.Batch_ID) : null;
-        let dist = ref ? d.find((x:any) => x.Refine_ID === ref.Refine_ID) : null;
-        let ret = dist ? r.find((x:any) => x.Distribution_ID === dist.Distribution_ID) : null;
-        if (stor) stage = 2; if (ref) stage = 3; if (dist) stage = 4; if (ret) stage = 5;
-        chains.push({ id: trans.Transit_ID, stage });
-    }
+    // Get all numeric IDs from previous stage
+    const prevRows: any = await query(`SELECT ${config.prevIdField} FROM ${config.prevTable}`);
+    const prevNumericIds = prevRows.map((row: any) => row[config.prevIdField].replace(config.prevPrefix, ''));
 
-    // Independent Storage orphans
-    for (let stor of s.filter((x:any) => !x.Transit_ID)) {
-        let stage = 2;
-        let ref = rp.find((x:any) => x.Batch_ID === stor.Batch_ID);
-        let dist = ref ? d.find((x:any) => x.Refine_ID === ref.Refine_ID) : null;
-        let ret = dist ? r.find((x:any) => x.Distribution_ID === dist.Distribution_ID) : null;
-        if (ref) stage = 3; if (dist) stage = 4; if (ret) stage = 5;
-        chains.push({ id: stor.Batch_ID, stage });
-    }
+    // Get all numeric IDs from current stage
+    const currentRows: any = await query(`SELECT ${config.idField} FROM ${config.table}`);
+    const currentNumericIds = new Set(currentRows.map((row: any) => row[config.idField].replace(config.prefix, '')));
 
-    // Independent Refining orphans
-    for (let ref of rp.filter((x:any) => !x.Batch_ID)) {
-        let stage = 3;
-        let dist = d.find((x:any) => x.Refine_ID === ref.Refine_ID);
-        let ret = dist ? r.find((x:any) => x.Distribution_ID === dist.Distribution_ID) : null;
-        if (dist) stage = 4; if (ret) stage = 5;
-        chains.push({ id: ref.Refine_ID, stage });
-    }
+    // Filter out IDs already used in current stage
+    const availableNumericIds = prevNumericIds.filter((id: string) => !currentNumericIds.has(id));
 
-    // Independent Dist orphans
-    for (let dist of d.filter((x:any) => !x.Refine_ID)) {
-        let stage = 4;
-        let ret = r.find((x:any) => x.Distribution_ID === dist.Distribution_ID);
-        if (ret) stage = 5;
-        chains.push({ id: dist.Distribution_ID, stage });
-    }
-
-    // Independent Retail orphans
-    for (let ret of r.filter((x:any) => !x.Distribution_ID)) {
-        chains.push({ id: ret.Retail_ID, stage: 5 });
-    }
-    
-    res.json(chains);
+    res.json(availableNumericIds);
   } catch (err: any) {
-    console.error('Pipeline status error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================================
-// PRESENTATION HIGHLIGHT: RECURSIVE SUPPLY CHAIN TRACKING (BATCH CHAIN)
-// This endpoint dynamically loops through all tables via their foreign keys 
-// (e.g. Crude -> Transport -> Storage -> Refining -> Distribution -> Retail)
-// to fetch the entire historical path of a single oil batch.
-// ============================================================================
-app.get('/api/batch_chain/:purchaseId', authenticateToken, async (req, res) => {
-  const { purchaseId } = req.params;
-  try {
-     const stages: any = {};
-     const stageIds: Record<number, string> = {};
-     
-     // Determine starting point - it could be in any table if user added disconnected records
-     const c = await query(`SELECT * FROM Crude_Purchase WHERE Purchase_ID = ?`, [purchaseId]);
-     const t = await query(`SELECT * FROM Transportation_Log WHERE Transit_ID = ?`, [purchaseId]);
-     const s = await query(`SELECT * FROM Storage_Batch WHERE Batch_ID = ?`, [purchaseId]);
-     const rp = await query(`SELECT * FROM Refining_Process WHERE Refine_ID = ?`, [purchaseId]);
-     const d = await query(`SELECT * FROM Distribution WHERE Distribution_ID = ?`, [purchaseId]);
-     const r = await query(`SELECT * FROM Retail WHERE Retail_ID = ?`, [purchaseId]);
-
-     if (c.length) {
-         stages[0] = c[0]; stageIds[0] = c[0].Purchase_ID;
-         let tChild = await query(`SELECT * FROM Transportation_Log WHERE Purchase_ID = ?`, [stageIds[0]]);
-         if (tChild.length) { stages[1] = tChild[0]; stageIds[1] = tChild[0].Transit_ID; }
-     }
-     else if (t.length) { stages[1] = t[0]; stageIds[1] = t[0].Transit_ID; }
-     else if (s.length) { stages[2] = s[0]; stageIds[2] = s[0].Batch_ID; }
-     else if (rp.length) { stages[3] = rp[0]; stageIds[3] = rp[0].Refine_ID; }
-     else if (d.length) { stages[4] = d[0]; stageIds[4] = d[0].Distribution_ID; }
-     else if (r.length) { stages[5] = r[0]; stageIds[5] = r[0].Retail_ID; }
-     
-     // Cascade downward iteratively from whatever ID is highest up
-     if (stageIds[1]) {
-         let sChild = await query(`SELECT * FROM Storage_Batch WHERE Transit_ID = ?`, [stageIds[1]]);
-         if (sChild.length) { stages[2] = sChild[0]; stageIds[2] = sChild[0].Batch_ID; }
-     }
-     if (stageIds[2]) {
-         let rpChild = await query(`SELECT * FROM Refining_Process WHERE Batch_ID = ?`, [stageIds[2]]);
-         if (rpChild.length) { stages[3] = rpChild[0]; stageIds[3] = rpChild[0].Refine_ID; }
-     }
-     if (stageIds[3]) {
-         let dChild = await query(`SELECT * FROM Distribution WHERE Refine_ID = ?`, [stageIds[3]]);
-         if (dChild.length) { stages[4] = dChild[0]; stageIds[4] = dChild[0].Distribution_ID; }
-     }
-     if (stageIds[4]) {
-         let rChild = await query(`SELECT * FROM Retail WHERE Distribution_ID = ?`, [stageIds[4]]);
-         if (rChild.length) { stages[5] = rChild[0]; stageIds[5] = rChild[0].Retail_ID; }
-     }
-
-    const ids = Object.values(stageIds).filter(Boolean) as string[];
-    let emissions: any = [];
-    if (ids.length > 0) {
-      const placeholders = ids.map(() => '?').join(',');
-      const emissionsQuery = `SELECT * FROM CO2_Emissions WHERE Reference_ID IN (${placeholders})`;
-      emissions = await query(emissionsQuery, ids);
-    }
-    
-    res.json({ stages, emissions, stageIds });
-  } catch (err: any) {
-    console.error('Batch chain error:', err);
+    console.error('Workflow IDs error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -510,4 +783,9 @@ async function startServer() {
   });
 }
 
+// Export app for Vercel serverless usage
+export { app };
+export default app;
+
+// Start server when run directly (not imported as module)
 startServer();

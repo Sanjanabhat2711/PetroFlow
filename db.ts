@@ -66,8 +66,11 @@ export async function initializeDatabase() {
       `CREATE TABLE IF NOT EXISTS Users (
         id ${isUsingMysql ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
         username ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL UNIQUE,
+        email ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL UNIQUE,
         password_hash ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL,
-        role ${isUsingMysql ? 'VARCHAR(50)' : 'TEXT'} NOT NULL DEFAULT 'USER'
+        role ${isUsingMysql ? 'VARCHAR(50)' : 'TEXT'} NOT NULL DEFAULT 'USER',
+        otp ${isUsingMysql ? 'VARCHAR(10)' : 'TEXT'},
+        otp_expiry ${isUsingMysql ? 'DATETIME' : 'TEXT'}
       )`,
       // Crude_Purchase
       `CREATE TABLE IF NOT EXISTS Crude_Purchase (
@@ -84,6 +87,7 @@ export async function initializeDatabase() {
         Driver_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
         Quantity INTEGER,
         Route_Type ${isUsingMysql ? 'VARCHAR(50)' : 'TEXT'} NOT NULL,
+        Distance INTEGER DEFAULT 500,
         Departure_Time ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL,
         Arrival_Time ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
         Fuel_Quality ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL,
@@ -95,6 +99,7 @@ export async function initializeDatabase() {
         Batch_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} PRIMARY KEY,
         Tank_Number INTEGER NOT NULL,
         Current_Capacity INTEGER NOT NULL,
+        Threshold INTEGER DEFAULT 5000,
         Last_Inspection_Date ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
         Transit_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
         FOREIGN KEY (Transit_ID) REFERENCES Transportation_Log(Transit_ID)
@@ -114,6 +119,7 @@ export async function initializeDatabase() {
       `CREATE TABLE IF NOT EXISTS Distribution (
         Distribution_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} PRIMARY KEY,
         Dispatch_Volume INTEGER NOT NULL,
+        Distance INTEGER DEFAULT 200,
         Delivery_Status ${isUsingMysql ? 'VARCHAR(50)' : 'TEXT'} NOT NULL,
         Adulteration_Test_Result TEXT,
         Final_Consumer_Hash TEXT,
@@ -138,6 +144,25 @@ export async function initializeDatabase() {
         Location ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
         Reference_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'}
       )`,
+      // System_Alerts
+      `CREATE TABLE IF NOT EXISTS System_Alerts (
+        Alert_ID ${isUsingMysql ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+        Type ${isUsingMysql ? 'VARCHAR(50)' : 'TEXT'} NOT NULL,
+        Message TEXT NOT NULL,
+        Status ${isUsingMysql ? 'VARCHAR(20)' : 'TEXT'} DEFAULT 'ACTIVE',
+        Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Correction_Snapshots (Json correction snapshot)
+      `CREATE TABLE IF NOT EXISTS Correction_Snapshots (
+        Snapshot_ID ${isUsingMysql ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+        Table_Name ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL,
+        Record_ID ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'} NOT NULL,
+        Error_Description TEXT,
+        JSON_Snapshot TEXT NOT NULL,
+        Triggered_By_Username ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
+        Triggered_By_Role ${isUsingMysql ? 'VARCHAR(255)' : 'TEXT'},
+        Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
       // Transaction_Ledger
       `CREATE TABLE IF NOT EXISTS Transaction_Ledger (
         Transaction_ID ${isUsingMysql ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -158,13 +183,41 @@ export async function initializeDatabase() {
       await query(sql);
     }
 
-    // SQLite Migration: Ensure 'role' column exists in Users
+    // SQLite Migrations: Ensure newer columns exist
     if (!isUsingMysql && sqliteDb) {
-      const tableInfo: any = sqliteDb.prepare("PRAGMA table_info(Users)").all();
-      const hasRole = tableInfo.some((col: any) => col.name === 'role');
-      if (!hasRole) {
-        console.log('Migrating SQLite: Adding role column to Users table...');
-        sqliteDb.prepare("ALTER TABLE Users ADD COLUMN role TEXT NOT NULL DEFAULT 'USER'").run();
+      const migrations = [
+        { table: 'Users', column: 'role', sql: "ALTER TABLE Users ADD COLUMN role TEXT NOT NULL DEFAULT 'USER'" },
+        { table: 'Users', column: 'email', sql: "ALTER TABLE Users ADD COLUMN email TEXT" },
+        { table: 'Users', column: 'otp', sql: "ALTER TABLE Users ADD COLUMN otp TEXT" },
+        { table: 'Users', column: 'otp_expiry', sql: "ALTER TABLE Users ADD COLUMN otp_expiry TEXT" },
+        { table: 'Storage_Batch', column: 'Threshold', sql: "ALTER TABLE Storage_Batch ADD COLUMN Threshold INTEGER DEFAULT 5000" },
+        { table: 'Transportation_Log', column: 'Distance', sql: "ALTER TABLE Transportation_Log ADD COLUMN Distance INTEGER DEFAULT 500" },
+        { table: 'Distribution', column: 'Distance', sql: "ALTER TABLE Distribution ADD COLUMN Distance INTEGER DEFAULT 200" },
+        { table: 'CO2_Emissions', column: 'Reference_ID', sql: "ALTER TABLE CO2_Emissions ADD COLUMN Reference_ID TEXT" },
+        { table: 'Transaction_Ledger', column: 'Old_Data', sql: "ALTER TABLE Transaction_Ledger ADD COLUMN Old_Data TEXT" },
+        { table: 'Transaction_Ledger', column: 'Operation', sql: "ALTER TABLE Transaction_Ledger ADD COLUMN Operation TEXT NOT NULL DEFAULT 'INSERT'" },
+        { table: 'Correction_Snapshots', column: 'Triggered_By_Username', sql: "ALTER TABLE Correction_Snapshots ADD COLUMN Triggered_By_Username TEXT" },
+        { table: 'Correction_Snapshots', column: 'Triggered_By_Role', sql: "ALTER TABLE Correction_Snapshots ADD COLUMN Triggered_By_Role TEXT" }
+      ];
+
+      for (const m of migrations) {
+        const tableInfo: any = sqliteDb.prepare(`PRAGMA table_info(${m.table})`).all();
+        const hasColumn = tableInfo.some((col: any) => col.name === m.column);
+        if (!hasColumn) {
+          try {
+            console.log(`Migrating SQLite: Adding ${m.column} column to ${m.table} table...`);
+            sqliteDb.prepare(m.sql).run();
+          } catch (migrationErr) {
+            console.error(`Migration failed for ${m.table}.${m.column}:`, migrationErr);
+          }
+        }
+      }
+
+      // Automatically migrate any legacy threshold values to the new requirement of 5000
+      try {
+        sqliteDb.prepare("UPDATE Storage_Batch SET Threshold = 5000").run();
+      } catch (e) {
+        console.error("Threshold data migration failed:", e);
       }
     }
 
